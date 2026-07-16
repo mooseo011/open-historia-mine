@@ -43,7 +43,7 @@
 - __diplomacy:__ negotiate with AI-controlled nations through natural language chat — click any country to talk to it or get an AI intelligence briefing
 - __ai advisor:__ consult your advisor for strategic guidance, economic analysis, and situation summaries
 - __map editor:__ a full vector map editor (draw, split, merge, paint owners, cities) built into the scenario editor — build a world and hit *Apply & Play*
-- __troops:__ deploy, move and battle armies; deployments stay pending until the AI resolves them; scenarios control which troop types exist in their era
+- __troops:__ deploy, move and battle armies; ground forces capture undefended regions they enter and territory they win in combat; scenarios control which troop types exist in their era
 - __scenario hub:__ browse, vote on and import community scenarios from the in-game **Community** tab, and publish your own
 - __self-hostable:__ run your own instance with your own AI backend completely offline
 

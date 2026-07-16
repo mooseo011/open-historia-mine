@@ -9,6 +9,7 @@ import {
   deployUnit,
   moveUnitTo,
   attackWith,
+  subscribeUnitWorld,
 } from "./unitsController.js";
 import { resolveRegionTarget, selectRegionFeature } from "./regionCapture.js";
 import {
@@ -585,6 +586,14 @@ const WorldMap = ({ isGlobe = false }) => {
       clearInterval(interval);
     };
   }, []);
+
+  // Unit commands persist movement and ownership in one world write. Reflect
+  // that saved world immediately so a captured border changes on the same click
+  // instead of waiting for the five-second safety poll.
+  useEffect(() => subscribeUnitWorld((world) => {
+    setWorldState(world ?? {});
+    setWorldKnown(true);
+  }), []);
 
   // Load custom region geometry once, only when the active map declares it. Stock
   // scenarios never hit the network for this. Ownership recolors live via the

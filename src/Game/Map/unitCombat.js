@@ -111,6 +111,9 @@ export const resolveClash = (attacker, defender, round = 1) => {
     attackerStrength,
     defenderStrength,
     attackerWins,
-    captured: defenderStrength <= 0 && attackerStrength > 0,
+    // Territory is decided by the world mutation layer, which also checks the
+    // unit type, exact region id and any additional defenders. Surviving loser
+    // strength represents routed troops, not continued control of the field.
+    attackerAdvances: attackerWins && attackerStrength > 0,
   };
 };

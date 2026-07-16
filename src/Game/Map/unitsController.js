@@ -12,15 +12,18 @@
 // in unitCombat.js for instant feedback; the AI reconciles fronts on the jump.
 
 import {
-  readWorldState,
-  writeWorldState,
+  mutateActionsState,
+  mutateWorldState,
   readGameData,
-  readActionsState,
-  writeActionsState,
+  readWorldState,
   normalizeUnitEntry,
 } from "../../runtime/gameState.js";
 import { resolveClash, distanceKm, engagementRangeKm, moveLeashKm } from "./unitCombat.js";
-import { applyRegionCaptureToWorld } from "./regionCapture.js";
+import {
+  applyCombatResultToWorld,
+  applyUnitMovementToWorld,
+  buildPlayerDeploymentInput,
+} from "./unitWorldMutations.js";
 
 let units = [];
 let playerCode = "";
@@ -30,9 +33,9 @@ let allowedUnitTypes = null; // null = all types allowed; else the scenario's wh
 let interactionMode = { kind: "idle" }; // idle | deploy | move | attack
 let pollTimer = null;
 let pendingCommits = 0; // suppress poll overwrite while queued mutations drain
-let commitQueue = Promise.resolve();
 
 const listeners = new Set();
+const worldListeners = new Set();
 const emit = () => {
   for (const fn of [...listeners]) {
     try {
@@ -43,9 +46,23 @@ const emit = () => {
   }
 };
 
+const emitWorld = (world) => {
+  for (const fn of [...worldListeners]) {
+    try {
+      fn(world);
+    } catch (error) {
+      console.error("world listener failed:", error);
+    }
+  }
+};
+
 export const subscribeUnits = (fn) => {
   listeners.add(fn);
   return () => listeners.delete(fn);
+};
+export const subscribeUnitWorld = (fn) => {
+  worldListeners.add(fn);
+  return () => worldListeners.delete(fn);
 };
 
 export const getUnits = () => units;
@@ -94,23 +111,20 @@ export const startUnitsSync = () => {
 // movement and border ownership are persisted together instead of competing writes.
 const commitWorld = (mutator) => {
   pendingCommits += 1;
-  const operation = commitQueue.then(async () => {
-    try {
-      const world = await readWorldState({ force: true });
-      const nextWorld = mutator(world) ?? world;
-      const saved = await writeWorldState(nextWorld);
-      units = saved.units ?? nextWorld.units ?? [];
+  const operation = mutateWorldState(mutator)
+    .then((saved) => {
+      units = saved.units ?? [];
       emit();
+      emitWorld(saved);
       return saved;
-    } catch (error) {
+    })
+    .catch((error) => {
       console.error("Failed to commit world unit state:", error);
       return null;
-    } finally {
+    })
+    .finally(() => {
       pendingCommits -= 1;
-    }
-  });
-  // Keep later local mutations ordered even when one write fails.
-  commitQueue = operation.then(() => undefined, () => undefined);
+    });
   return operation;
 };
 
@@ -124,15 +138,13 @@ const commit = async (mutator) => {
 
 const queueOrder = async (text) => {
   try {
-    const actions = await readActionsState({ force: true });
-    actions.push({
+    await mutateActionsState((actions) => [...actions, {
       kind: "action",
       source: "order",
       status: "planned",
       text,
       title: text.length > 60 ? `${text.slice(0, 57)}...` : text,
-    });
-    await writeActionsState(actions);
+    }]);
   } catch (error) {
     console.error("Failed to queue order:", error);
   }
@@ -140,28 +152,27 @@ const queueOrder = async (text) => {
 
 export const deployUnit = async ({ type, strength, name, lng, lat, region = null }) => {
   if (!playerCode) await refresh();
-  // Deploy as PENDING (rendered translucent): the player states an intent, and the
-  // AI confirms, relocates or rejects it on the next time-jump.
+  // Player deployments are immediately active. Pending is reserved for units the
+  // simulation still needs to adjudicate; a pending unit cannot move, attack or
+  // occupy a region, which made newly placed player armies look interactive while
+  // silently preventing every command.
   const saved = await commit((list) => {
-    const unit = normalizeUnitEntry({
+    const unit = normalizeUnitEntry(buildPlayerDeploymentInput({
       type,
       strength,
       name,
       lng,
       lat,
-      regionId: region?.id,
+      region,
       ownerCode: playerCode || "PLAYER",
-      source: "player",
-      status: "pending",
-    });
+    }));
     return unit ? [...list, unit] : list;
   });
   if (!saved) return null;
   await queueOrder(
-    `Deploy request: ${name || type} (${type}, strength ${strength}, owner ${playerCode || "PLAYER"}) at ` +
-      `lat ${lat.toFixed(2)}, lng ${lng.toFixed(2)}. Currently pending — confirm it into the order of battle, ` +
-      `reposition it, or reject it as the front and logistics allow.` +
-      `${region?.id ? ` Intended region: ${region.name || region.id} (exact id ${region.id}).` : ""}`,
+    `Deployed ${name || type} (${type}, strength ${strength}, owner ${playerCode || "PLAYER"}) at ` +
+      `lat ${lat.toFixed(2)}, lng ${lng.toFixed(2)}. It is active in the order of battle.` +
+      `${region?.id ? ` Region: ${region.name || region.id} (exact id ${region.id}).` : ""}`,
   );
   return saved;
 };
@@ -194,24 +205,12 @@ export const moveUnitTo = async (unitId, lng, lat, targetRegion = null) => {
 
   let capture = null;
   const saved = await commitWorld((world) => {
-    const timestamp = new Date().toISOString();
-    const nextUnits = (world.units ?? []).map((currentUnit) =>
-      currentUnit.id === unitId
-        ? {
-            ...currentUnit,
-            lng,
-            lat,
-            regionId: targetRegion?.id || currentUnit.regionId,
-            status: currentUnit.status === "pending" ? "pending" : "moving",
-            updatedAt: timestamp,
-          }
-        : currentUnit,
-    );
-    const applied = applyRegionCaptureToWorld({
+    const applied = applyUnitMovementToWorld({
       world,
-      units: nextUnits,
       unitId,
-      region: targetRegion,
+      lng,
+      lat,
+      targetRegion,
     });
     capture = applied.capture;
     return applied.world;
@@ -264,48 +263,33 @@ export const attackWith = async (attackerId, targetId, targetRegion = null) => {
   }
 
   const result = resolveClash(attacker, defender, round);
-  const destinationRegion = targetRegion?.id
-    ? targetRegion
-    : defender.regionId
-      ? { id: defender.regionId, name: defender.regionId, ownerCode: defender.ownerCode }
+  // The defender's persisted region wins over a possibly adjacent polygon hit
+  // beneath its map marker. This prevents edge clicks from capturing the wrong
+  // side of a border.
+  const destinationRegion = defender.regionId
+    ? {
+        id: defender.regionId,
+        name: targetRegion?.id === defender.regionId
+          ? targetRegion.name || defender.regionId
+          : defender.regionId,
+        ownerCode: targetRegion?.id === defender.regionId
+          ? targetRegion.ownerCode || defender.ownerCode
+          : defender.ownerCode,
+        defendingUnitIds: targetRegion?.id === defender.regionId
+          ? targetRegion.defendingUnitIds
+          : [defender.id],
+      }
+    : targetRegion?.id
+      ? targetRegion
       : null;
   let capture = null;
   const saved = await commitWorld((world) => {
-    const timestamp = new Date().toISOString();
-    const nextUnits = (world.units ?? [])
-      .map((u) => {
-        if (u.id === attackerId) {
-          const survives = result.attackerStrength > 0;
-          return {
-            ...u,
-            strength: result.attackerStrength,
-            status: survives ? "engaged" : "defeated",
-            lng: survives && result.captured ? defender.lng : u.lng,
-            lat: survives && result.captured ? defender.lat : u.lat,
-            regionId: survives && result.captured && destinationRegion?.id
-              ? destinationRegion.id
-              : u.regionId,
-            updatedAt: timestamp,
-          };
-        }
-        if (u.id === targetId) {
-          return {
-            ...u,
-            strength: result.defenderStrength,
-            status: result.defenderStrength > 0 ? "engaged" : "defeated",
-            updatedAt: timestamp,
-          };
-        }
-        return u;
-      })
-      .filter((u) => u.strength > 0);
-    if (!result.captured) return { ...world, units: nextUnits };
-
-    const applied = applyRegionCaptureToWorld({
+    const applied = applyCombatResultToWorld({
       world,
-      units: nextUnits,
-      unitId: attackerId,
-      region: destinationRegion,
+      attackerId,
+      defenderId: targetId,
+      destinationRegion,
+      result,
     });
     capture = applied.capture;
     return applied.world;
@@ -321,7 +305,7 @@ export const attackWith = async (attackerId, targetId, targetRegion = null) => {
       `attacker strength ${result.attackerStrength}, defender strength ${result.defenderStrength}` +
       `${capture
         ? `; attacker holds ${capture.regionName} (exact id ${capture.regionId}) and local ownership already changed from ${capture.fromCode || "unclaimed"} to ${capture.toCode}`
-        : result.captured
+        : result.attackerAdvances
           ? `; attacker holds the field${destinationRegion?.id ? ` in exact region ${destinationRegion.id}` : ""}, but local ownership did not change`
           : ""}. ` +
       `Escalate, reinforce or counterattack as the wider front warrants.`,

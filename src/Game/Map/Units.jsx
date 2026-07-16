@@ -80,7 +80,7 @@ const Units = () => {
         paint={{
           "circle-radius": ["interpolate", ["linear"], ["zoom"], 2, 7, 6, 11, 12, 16],
           "circle-color": ["get", "rgb"],
-          // Pending (player-requested, not yet AI-resolved) units are translucent.
+          // Pending AI/scenario units awaiting adjudication are translucent.
           "circle-opacity": ["case", ["==", ["get", "status"], "pending"], 0.32, 0.92],
           "circle-stroke-width": ["case", ["==", ["get", "status"], "pending"], 1.5, 2],
           "circle-stroke-color": [

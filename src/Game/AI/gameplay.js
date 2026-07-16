@@ -2,6 +2,7 @@
 import { callAI } from "./main.jsx";
 import { normalizePromptPack } from "./gameplayPrompts.js";
 import { getGameplayTool, validateGameplayPayload } from "./gameplaySchemas.js";
+import { mergeLiveActions, mergeLiveWorldState } from "./gameplayWorldMerge.js";
 import { getActiveRegionCatalog, validateRegionTransfers } from "./regionOwnershipValidation.js";
 import {
   buildActionHistoryText,
@@ -29,17 +30,15 @@ import {
   normalizeEvents,
   normalizeGameData,
   normalizeWorldState,
-  readActionsState,
+  mutateActionsState,
+  mutateWorldState,
   readChatsState,
   readEventsState,
   readGameData,
   readGameStateBundle,
-  readWorldState,
-  writeActionsState,
   writeChatsState,
   writeEventsState,
   writeGameData,
-  writeWorldState,
 } from "../../runtime/gameState.js";
 import { difficultyDirective } from "../../runtime/difficulty.js";
 
@@ -1039,13 +1038,37 @@ const applySimulationResult = async ({
     }
   }
 
+  // AI generation works from baseWorld and can take minutes. Merge and persist
+  // inside the same world mutation queue used by unit commands. A capture is
+  // therefore ordered wholly before or after this save, never inside its stale
+  // read/write window.
+  const simulatedWorld = nextWorld;
+  const saveMergedWorld = mutateWorldState((liveWorld) => {
+    nextWorld = mergeLiveWorldState({
+      baseWorld,
+      liveWorld,
+      simulatedWorld,
+    });
+    return nextWorld;
+  });
+
+  let savedActions = nextActions;
+  const saveMergedActions = mutateActionsState((liveActions) => {
+    savedActions = mergeLiveActions({
+      baseActions,
+      liveActions,
+      simulatedActions: nextActions,
+    });
+    return savedActions;
+  });
+
   await Promise.all([
-    writeActionsState(nextActions),
+    saveMergedActions,
     writeChatsState(nextChats),
     writeEventsState(nextEvents),
     writeGameData(nextGame),
     writeJson(JSON_URLS.colors, nextColors, { pretty: true }),
-    writeWorldState(nextWorld),
+    saveMergedWorld,
   ]);
 
   // Snapshot the state we just replaced so it can be rolled back to (best-effort).
@@ -1062,7 +1085,7 @@ const applySimulationResult = async ({
   });
 
   return {
-    actions: nextActions,
+    actions: savedActions,
     chats: nextChats,
     colors: nextColors,
     events: nextEvents,
@@ -1127,9 +1150,10 @@ export const generateActionSuggestions = async ({ force = true } = {}) => {
     topics = normalizeTopics((await fallbackActionSuggestions(bundle))?.topics);
   }
 
-  const world = normalizeWorldState(await readWorldState());
-  world.actionSuggestions = topics;
-  await writeWorldState(world);
+  await mutateWorldState((world) => ({
+    ...world,
+    actionSuggestions: topics,
+  }));
 
   return topics;
 };
@@ -1265,8 +1289,7 @@ export const refinePlayerAction = async (rawInput, { persist = true } = {}) => {
   }
 
   if (persist) {
-    const nextActions = [...(await readActionsState({ force: true })), action];
-    await writeActionsState(nextActions);
+    await mutateActionsState((actions) => [...actions, action]);
   }
 
   return action;
@@ -1337,9 +1360,10 @@ export const createCatalyst = async ({ force = true } = {}) => {
     title: normalizeString(payload?.title),
   };
 
-  const world = normalizeWorldState(await readWorldState({ force: true }));
-  world.activeCatalyst = catalyst;
-  await writeWorldState(world);
+  await mutateWorldState((world) => ({
+    ...world,
+    activeCatalyst: catalyst,
+  }));
   return catalyst;
 };
 
@@ -1398,11 +1422,14 @@ export const advanceActiveCatalyst = async (choiceText) => {
   };
 
   if (!payload?.resolved) {
-    const nextWorld = {
-      ...world,
-      activeCatalyst: nextCatalyst,
-    };
-    await writeWorldState(nextWorld);
+    let nextWorld = world;
+    await mutateWorldState((liveWorld) => {
+      nextWorld = {
+        ...liveWorld,
+        activeCatalyst: nextCatalyst,
+      };
+      return nextWorld;
+    });
     return {
       catalyst: nextCatalyst,
       world: nextWorld,

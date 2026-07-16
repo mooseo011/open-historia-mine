@@ -36,7 +36,8 @@ export const WORLD_DEFAULTS = {
 // so they share every existing read/write/poll/normalize path with no server change.
 export const UNIT_TYPES = ["infantry", "armor", "air", "naval", "artillery", "garrison"];
 const UNIT_TYPE_SET = new Set(UNIT_TYPES);
-// "pending" = a player deployment awaiting AI resolution (rendered translucent).
+// "pending" is reserved for AI/scenario units awaiting simulation adjudication.
+// Player deployments are active immediately; normalize old saves into that model.
 const UNIT_STATUS_SET = new Set(["idle", "moving", "engaged", "defeated", "pending"]);
 const UNIT_SOURCE_SET = new Set(["player", "ai", "scenario"]);
 
@@ -98,14 +99,17 @@ const normalizeActionParticipants = (value) =>
     .map((entry) => normalizeString(entry))
     .filter(Boolean);
 
-export const normalizeActionEntry = (entry, index = 0) => {
+export const normalizeActionEntry = (entry, index = 0, { stableMissingId = false } = {}) => {
+  const fallbackId = () => stableMissingId
+    ? `normalized-legacy-action-${index}`
+    : generateId(`action-${index}`);
   if (typeof entry === "string") {
     const text = normalizeString(entry);
     if (!text) return null;
 
     return {
       createdAt: new Date().toISOString(),
-      id: generateId(`action-${index}`),
+      id: fallbackId(),
       kind: "action",
       participants: [],
       rawInput: text,
@@ -138,7 +142,7 @@ export const normalizeActionEntry = (entry, index = 0) => {
   return {
     chatStarter: normalizeOptionalString(entry.chatStarter || entry.openingMessage),
     createdAt: normalizeOptionalString(entry.createdAt) || new Date().toISOString(),
-    id: normalizeOptionalString(entry.id) || generateId(`action-${index}`),
+    id: normalizeOptionalString(entry.id) || fallbackId(),
     invitees: normalizeActionParticipants(entry.invitees),
     kind,
     participants: normalizeActionParticipants(entry.participants),
@@ -153,7 +157,7 @@ export const normalizeActionEntry = (entry, index = 0) => {
 
 export const normalizeActions = (actions) =>
   normalizeArray(actions)
-    .map((entry, index) => normalizeActionEntry(entry, index))
+    .map((entry, index) => normalizeActionEntry(entry, index, { stableMissingId: true }))
     .filter(Boolean);
 
 const normalizeCatalystChoice = (entry, index = 0) => {
@@ -421,7 +425,7 @@ const normalizePolityChange = (entry) => {
   };
 };
 
-export const normalizeUnitEntry = (entry, index = 0) => {
+export const normalizeUnitEntry = (entry, index = 0, { stableMissingId = false } = {}) => {
   if (!entry || typeof entry !== "object") {
     return null;
   }
@@ -436,10 +440,14 @@ export const normalizeUnitEntry = (entry, index = 0) => {
   const type = normalizeOptionalString(entry.type).toLowerCase();
   const status = normalizeOptionalString(entry.status).toLowerCase();
   const source = normalizeOptionalString(entry.source).toLowerCase();
+  const normalizedSource = UNIT_SOURCE_SET.has(source) ? source : "scenario";
+  const normalizedStatus = UNIT_STATUS_SET.has(status) ? status : "idle";
   const timestamp = new Date().toISOString();
 
   return {
-    id: normalizeOptionalString(entry.id) || generateId(`unit-${index}`),
+    id: normalizeOptionalString(entry.id) || (stableMissingId
+      ? `normalized-legacy-unit-${index}`
+      : generateId(`unit-${index}`)),
     name: normalizeOptionalString(entry.name) || "Unit",
     type: UNIT_TYPE_SET.has(type) ? type : "infantry",
     ownerCode,
@@ -447,9 +455,11 @@ export const normalizeUnitEntry = (entry, index = 0) => {
     lng,
     lat,
     regionId: normalizeOptionalString(entry.regionId),
-    status: UNIT_STATUS_SET.has(status) ? status : "idle",
+    status: normalizedSource === "player" && normalizedStatus === "pending"
+      ? "idle"
+      : normalizedStatus,
     note: normalizeOptionalString(entry.note),
-    source: UNIT_SOURCE_SET.has(source) ? source : "scenario",
+    source: normalizedSource,
     orderId: normalizeOptionalString(entry.orderId),
     createdAt: normalizeOptionalString(entry.createdAt) || timestamp,
     updatedAt: normalizeOptionalString(entry.updatedAt) || timestamp,
@@ -458,7 +468,7 @@ export const normalizeUnitEntry = (entry, index = 0) => {
 
 export const normalizeUnits = (units) =>
   normalizeArray(units)
-    .map((entry, index) => normalizeUnitEntry(entry, index))
+    .map((entry, index) => normalizeUnitEntry(entry, index, { stableMissingId: true }))
     .filter(Boolean);
 
 // One AI-authored mutation to the unit list: spawn | move | strength | remove.
@@ -781,7 +791,7 @@ export const buildActionDisplayText = (action) => {
 export const readWorldState = async ({ force = false } = {}) =>
   normalizeWorldState(await readJson(JSON_URLS.world, { defaultValue: WORLD_DEFAULTS, force }));
 
-export const writeWorldState = async (world, options = {}) => {
+const persistWorldState = async (world, options = {}) => {
   const normalized = normalizeWorldState(world);
   // Edited/AI-written polity names, aliases and notes get translated (and
   // saved to the server language pack) the moment they're written, not when
@@ -789,6 +799,27 @@ export const writeWorldState = async (world, options = {}) => {
   enqueueContentStrings(normalized.polityOverrides);
   return writeJson(JSON_URLS.world, normalized, { pretty: true, ...options });
 };
+
+let worldMutationQueue = Promise.resolve();
+
+const queueWorldOperation = (operation) => {
+  const queued = worldMutationQueue.then(operation);
+  worldMutationQueue = queued.then(() => undefined, () => undefined);
+  return queued;
+};
+
+export const writeWorldState = (world, options = {}) =>
+  queueWorldOperation(() => persistWorldState(world, options));
+
+// Read and write under the same in-page lock used by every unit command and AI
+// turn save. A capture can therefore happen before or after a simulation save,
+// but never inside a stale read/write window where one silently erases the other.
+export const mutateWorldState = (mutator, options = {}) =>
+  queueWorldOperation(async () => {
+    const current = await readWorldState({ force: true });
+    const next = typeof mutator === "function" ? mutator(current) : current;
+    return persistWorldState(next ?? current, options);
+  });
 
 export const readGameData = async ({ force = false } = {}) =>
   normalizeGameData(await readJson(JSON_URLS.game, { defaultValue: GAME_DEFAULTS, force }));
@@ -801,6 +832,21 @@ export const readActionsState = async ({ force = false } = {}) =>
 
 export const writeActionsState = async (actions, options = {}) =>
   writeJson(JSON_URLS.actions, normalizeActions(actions), { pretty: true, ...options });
+
+let actionMutationQueue = Promise.resolve();
+
+// Serialize action read-modify-write operations within the running game. This
+// keeps an order queued during a long AI generation from racing the turn's
+// action-status save and disappearing whichever write finishes last.
+export const mutateActionsState = (mutator, options = {}) => {
+  const operation = actionMutationQueue.then(async () => {
+    const current = await readActionsState({ force: true });
+    const next = typeof mutator === "function" ? mutator(current) : current;
+    return writeActionsState(next ?? current, options);
+  });
+  actionMutationQueue = operation.then(() => undefined, () => undefined);
+  return operation;
+};
 
 export const readEventsState = async ({ force = false } = {}) =>
   normalizeEvents(await readJson(JSON_URLS.events, { defaultValue: [], force }));
