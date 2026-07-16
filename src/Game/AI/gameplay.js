@@ -737,7 +737,6 @@ const validateGeneratedWorldChanges = async (candidate, world) => {
       .filter(Boolean),
   );
   await resolveRegionTransfers(containers, world);
-  const unitIds = new Set(normalizeWorldState(world).units.map((unit) => normalizeString(unit.id)).filter(Boolean));
   const generatedPolities = [];
 
   for (const { impacts, path } of containers) {
